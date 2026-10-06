@@ -6,24 +6,86 @@ import time         # 시간 측정 및 대기
 from ultralytics import YOLO                # 번호판 위치 검출
 from collections import Counter, deque      # 득표수 계산, 최근 OCR 결과 보관
 from picamera2 import Picamera2, Preview    # Pi 카메라 제어 및 미리보기
-
+import subprocess
+from pathlib import Path
 
 model = YOLO("models/best_plate_yolo26.pt")
 reader = easyocr.Reader(["ko", "en"], gpu=False)
 
-def is_registered_vehicle(plate):
-    response = requests.post(   # Flask 서버로 POST 요청을 보내고 응답 저장
-        "http://127.0.0.1:5000/check_plate",    # 같은 장치에서 실행 중인 서버 주소
-        json={"plate_number": plate},       # 번호판 문자열을
-        timeout=5)
-    response.raise_for_status()  # HTTP 오류가 있으면 예외 발생
-    data = response.json()  # JSON 응답을 Python 데이터로 변환
+SERVER = "http://192.168.10.12:5000"
 
-    registered = data.get("registered")  # 등록 여부 추출, 키가 없으면 None
-    if not isinstance(registered, bool):  # True/False 타입인지 확인
-        raise ValueError("서버 응답에 등록 여부가 없거나 형식이 잘못됐습니다")
+SERVO = (Path(__file__).resolve().parent.parent/"hardware"/"servo"/"sg90")
 
-    return registered  # 등록이면 True, 미등록이면 False 반환
+def control_gate(command):
+    subprocess.run(["sudo", "-n", str(SERVO), command], check=True, timeout=5,)
+
+def check_gate_reservation(plate):
+    response = requests.get(
+        f"{SERVER}/reservations/check",
+        params={"plate": plate},  # 입구 확인이므로 spot_id는 보내지 않음
+        timeout=5,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise ValueError("서버 응답 형식이 잘못됐습니다")
+
+    if data.get("success") is not True:
+        raise ValueError(data.get("message") or "예약 조회 실패")
+
+    allowed = data.get("allowed")
+    if not isinstance(allowed, bool):
+        raise ValueError("서버 응답에 승인 여부가 없거나 형식이 잘못됐습니다")
+
+    if allowed:
+        reservation_id = data.get("reservation_id")
+        spot_id = data.get("spot_id")
+        action = data.get("action")
+
+        # bool은 Python에서 int의 하위 타입이므로 type으로 검사
+        if type(reservation_id) is not int or reservation_id <= 0:
+            raise ValueError("예약 번호가 잘못됐습니다")
+        if type(spot_id) is not int or not 1 <= spot_id <= 6:
+            raise ValueError("주차칸 번호가 잘못됐습니다")
+        if action not in ("enter", "exit"):
+            raise ValueError("게이트 동작 정보가 잘못됐습니다")
+
+    return data
+
+def request_parking_enter(reservation_id):
+    response = requests.post(
+        f"{SERVER}/parking/enter",
+        json={"reservation_id": reservation_id},
+        timeout=5,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise ValueError("서버 응답 형식이 잘못됐습니다")
+
+    if data.get("success") is not True:
+        raise ValueError(data.get("message") or "입차 처리 실패")
+
+    return data
+
+def request_parking_exit(reservation_id):
+    response = requests.post(
+        f"{SERVER}/parking/exit",
+        json={"reservation_id": reservation_id},
+        timeout=5,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise ValueError("서버 응답 형식이 잘못됐습니다")
+
+    if data.get("success") is not True:
+        raise ValueError(data.get("message") or "출차 처리 실패")
+
+    return data
 
 def recognize_plate(plate):
     gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
@@ -60,7 +122,7 @@ picam2 = Picamera2()
 camera_config = picam2.create_preview_configuration(main={"size": (1920, 1080), "format": "XRGB8888"})
 
 picam2.configure(camera_config) # 만든 설정을 카메라에 적용
-picam2.start_preview(Preview.QTGL) # 카메라 영상을 화면에 보여주는 미리보기 창 준비
+# picam2.start_preview(Preview.QTGL) # 카메라 영상을 화면에 보여주는 미리보기 창 준비
 picam2.start()
 time.sleep(1)
 
@@ -68,7 +130,12 @@ time.sleep(1)
 recent_plates = deque(maxlen=5)  
 
 final_plate = None  
+
+gate_reservation_id = None
+gate_spot_id = None
+gate_action = None
 gate_state = "WAITING"
+
 recognition_start = None
 rejected_time = None
 last_detected_time = None
@@ -89,18 +156,47 @@ try:
             continue
 
         if gate_state == "OPEN":
-            print("차단기 OPEN 상태")
-            passage_detected = True  # 테스트용. 실제 센서 감지 아님.
+            input(
+                f"차단봉 열림 [{gate_action}]. "
+                "차량이 완전히 통과한 뒤 Enter를 누르세요 [수동 테스트]: "
+            )
 
-            if passage_detected:
-                print("차량 통과 감지 (테스트)")
-                print("차단기 CLOSE (테스트)")
-                gate_state = "WAITING"
-                recent_plates.clear()
-                final_plate = None
-                recognition_start = None
+            try:
+                if gate_action == "enter":
+                    result = request_parking_enter(gate_reservation_id)
+                    print("입차 처리 성공")
+
+                elif gate_action == "exit":
+                    result = request_parking_exit(gate_reservation_id)
+                    print("출차 처리 성공")
+
+                else:
+                    raise ValueError("알 수 없는 게이트 동작입니다")
+
+                print("예약 번호:", result["reservation_id"])
+                print("주차칸:", result["spot_id"])
+
+            except (requests.exceptions.RequestException, ValueError) as error:
+                print("주차 상태 변경 API 실패:", error)
+                print("서버의 예약 상태를 확인해야 합니다")
+
+            try:
+                control_gate("close")
+
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as error:
+                print("차단봉 닫기 명령 실패:", error)
+                print("장치 확인 필요 -> 테스트 종료")
                 break
-            continue
+
+            print("차단봉 닫기 명령 전송 완료")
+
+            # 이번에는 한 차량만 테스트
+            break
+            
 
         frame = picam2.capture_array() # 카메라에서 영상 한 프레임을 NumPy 배열로 가져옴
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) # 4채널 -> BGR 3채널로 변환
@@ -109,7 +205,7 @@ try:
         results = model(frame, conf=0.5, imgsz=640, classes=[1], verbose=False)
         print("YOLO:", (time.perf_counter() - start) * 1000, "ms")
 
-        result = results[0]
+        result = results[0] # 첫 번째 이미지의 검출 결과 꺼내기
 
         if len(result.boxes) == 0:
             if last_detected_time is not None:
@@ -137,7 +233,7 @@ try:
         print("BOX:", x1, y1, x2, y2)
 
         plate = frame[y1:y2, x1:x2].copy()
-        text, ocr_conf, processed = recognize_plate(plate)
+        text, ocr_conf = recognize_plate(plate)
       
         if is_valid_plate(text):
             if recognition_start is None:
@@ -161,23 +257,49 @@ try:
                 recognition_start = None
 
                 try:
-                    registered = is_registered_vehicle(final_plate)
+                    gate = check_gate_reservation(final_plate)
 
                 except (requests.exceptions.RequestException, ValueError) as error:
                     print("API 조회 실패:", error)
                     print("승인 확인 불가 → 차단기 유지")
+                    gate_reservation_id = None
+                    gate_spot_id = None
+                    gate_action = None
                     gate_state = "REJECTED"
                     rejected_time = time.monotonic()
 
                 else:
-                    if registered:
-                        print("등록 차량")
-                        gate_state = "OPEN"
+                    if gate["allowed"]:
+                        gate_reservation_id = gate["reservation_id"]
+                        gate_spot_id = gate["spot_id"]
+                        gate_action = gate["action"]
+
+                        print("게이트 승인:", final_plate)
+                        print("동작:", gate_action)
+                        print("예약 번호:", gate_reservation_id)
+                        print("주차칸:", gate_spot_id)
+                        try:
+                            control_gate("open")
+                        except (subprocess.CalledProcessError,
+                                subprocess.TimeoutExpired,
+                                OSError,
+                        ) as error:
+                            print("차단봉 열기 명령 실패:", error)
+                            print("장치 확인 필요 -> 테스트 종료")
+                            break
+                        else:
+                            print("차단봉 열기 명령 전송 완료")
+                            gate_state = "OPEN"
                     else:
-                        print("미등록 차량")
+                        print("게이트 불허:", gate.get("message", "예약 확인 불가"))
+
+                        gate_reservation_id = None
+                        gate_spot_id = None
+                        gate_action = None
+
                         gate_state = "REJECTED"
                         rejected_time = time.monotonic()
-
+                                    
 except KeyboardInterrupt:
     print("\n프로그램 종료")
 

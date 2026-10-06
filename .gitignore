@@ -1,16 +1,40 @@
+# =========================
 # Python
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
-# YOLO model weights
-*.pt
-
-# Videos
-*.mp4
-
-# Virtual environments
+# Virtual environment
 .venv/
 venv/
 
-# Environment variables
+# =========================
+# Environment / secrets
+# =========================
 .env
+**/.env
+
+# =========================
+# Database / backup
+# =========================
+*.sql
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Vision temporary files
+# =========================
+vision/new_dataset/
+vision/plate_debug.jpg
+vision/plate_processed.jpg
+vision/plate_test.mp4
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
