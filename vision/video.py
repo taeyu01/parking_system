@@ -12,7 +12,8 @@ from pathlib import Path
 model = YOLO("models/best_plate_yolo26.pt")
 reader = easyocr.Reader(["ko", "en"], gpu=False)
 
-SERVER = "http://192.168.10.12:5000"
+# SERVER = "http://192.168.10.12:5000" 
+SERVER = "http://192.168.0.97:5000"
 
 SERVO = (Path(__file__).resolve().parent.parent/"hardware"/"servo"/"sg90")
 
@@ -93,7 +94,7 @@ def recognize_plate(plate):
     gray = clahe.apply(gray)    # 대비 개선 적용
     gray = cv2.resize(gray, None, fx=3, fy=3, 
                       interpolation=cv2.INTER_CUBIC) # 보간법
-
+    cv2.imwrite("debug_plate.jpg", gray)
     start = time.perf_counter() # OCR 시작 시간 기록
     ocr_result = reader.recognize(gray, detail=1)   # 문자와 신뢰도 등을 반환
     print("OCR:", (time.perf_counter() - start) * 1000, "ms")   # OCR 소요 시간 출력
@@ -103,6 +104,13 @@ def recognize_plate(plate):
 
     text = ocr_result[0][1].replace(" ", "")
     text = re.sub(r"[^0-9가-힣]", "", text)
+
+    # '가'를 '71'로 오인식한 경우 보정
+    if re.fullmatch(r"[0-9]{3}71[0-9]{4}", text):
+        text = text[:3] + "가" + text[5:]
+    elif re.fullmatch(r"[0-9]{2}71[0-9]{4}", text):
+        text = text[:2] + "가" + text[4:]
+
     ocr_conf = ocr_result[0][2]
 
     print("OCR TEXT:", text)
@@ -222,8 +230,14 @@ try:
         x1, y1, x2, y2 = map(int, best_box.xyxy[0])
 
         h, w = frame.shape[:2]
-        x1, x2 = max(0, x1), min(w, x2)
-        y1, y2 = max(0, y1), min(h, y2)
+        # 번호판이 잘리지 않도록 여백 추가
+        pad_x = 30
+        pad_y = 10
+
+        x1 = max(0, x1 - pad_x)
+        x2 = min(w, x2 + pad_x)
+        y1 = max(0, y1 - pad_y)
+        y2 = min(h, y2 + pad_y)
 
         if x2 <= x1 or y2 <= y1:
             continue
