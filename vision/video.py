@@ -12,13 +12,17 @@ from pathlib import Path
 model = YOLO("models/best_plate_yolo26.pt")
 reader = easyocr.Reader(["ko", "en"], gpu=False)
 
-# SERVER = "http://192.168.10.12:5000" 
-SERVER = "http://192.168.0.97:5000"
+SERVER = "http://192.168.10.12:5000" 
+# SERVER = "http://192.168.0.97:5000"
 
 SERVO = (Path(__file__).resolve().parent.parent/"hardware"/"servo"/"sg90")
+IR = (Path(__file__).resolve().parent.parent/"hardware"/"ir"/"ir")
 
 def control_gate(command):
     subprocess.run(["sudo", "-n", str(SERVO), command], check=True, timeout=5,)
+
+def wait_vehicle_pass():
+    subprocess.run(["sudo", "-n", str(IR)], check=True, timeout=30,)
 
 def check_gate_reservation(plate):
     response = requests.get(
@@ -164,10 +168,27 @@ try:
             continue
 
         if gate_state == "OPEN":
-            input(
-                f"차단봉 열림 [{gate_action}]. "
-                "차량이 완전히 통과한 뒤 Enter를 누르세요 [수동 테스트]: "
-            )
+            print(f"차단봉 열림 [{gate_action}]")
+            print("차량 통과 대기 중...")
+
+            try:
+                wait_vehicle_pass()
+                print("차량 통과 완료")
+
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as error:
+                print("IR 차량 통과 감지 실패:", error)
+                print("안전을 위해 주차 상태를 변경하지 않습니다")
+
+                try:
+                    control_gate("close")
+                except Exception as close_error:
+                    print("차단봉 닫기 실패:", close_error)
+
+                break
 
             try:
                 if gate_action == "enter":
