@@ -24,6 +24,32 @@ def control_gate(command):
 def wait_vehicle_pass():
     subprocess.run(["sudo", "-n", str(IR)], check=True, timeout=30,)
 
+# 공용 차단봉: 모든 주차 공간의 출차 요청을 조회한다.
+def get_pending_exit_requests():
+    response = requests.get(f"{SERVER}/gate/pending", timeout=5)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or data.get("success") is not True:
+        raise ValueError("출차 요청 조회 응답 오류")
+    pending = data.get("requests")
+    if not isinstance(pending, list):
+        raise ValueError("출차 요청 목록 형식 오류")
+    return pending
+
+
+def notify_gate_opened(reservation_id):
+    response = requests.post(
+        f"{SERVER}/gate/opened",
+        json={"reservation_id": reservation_id},
+        timeout=5,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or data.get("success") is not True:
+        raise ValueError("차단봉 개방 확인 API 오류")
+    return data
+
+
 def check_gate_reservation(plate):
     response = requests.get(
         f"{SERVER}/reservations/check",
@@ -94,11 +120,18 @@ def request_parking_exit(reservation_id):
 
 def recognize_plate(plate):
     gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) # 부분별 대비 개선 설정
-    gray = clahe.apply(gray)    # 대비 개선 적용
-    gray = cv2.resize(gray, None, fx=3, fy=3, 
-                      interpolation=cv2.INTER_CUBIC) # 보간법
-    cv2.imwrite("debug_plate.jpg", gray)
+   
+    # 대비 개선 적용
+    gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+
+    gray = cv2.resize(
+        gray, None,
+        fx=2, fy=2,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    cv2.imwrite("debug_plate_original.jpg", plate)
+    cv2.imwrite("debug_plate_processed.jpg", gray)
     start = time.perf_counter() # OCR 시작 시간 기록
     ocr_result = reader.recognize(gray, detail=1)   # 문자와 신뢰도 등을 반환
     print("OCR:", (time.perf_counter() - start) * 1000, "ms")   # OCR 소요 시간 출력
@@ -109,11 +142,9 @@ def recognize_plate(plate):
     text = ocr_result[0][1].replace(" ", "")
     text = re.sub(r"[^0-9가-힣]", "", text)
 
-    # '가'를 '71'로 오인식한 경우 보정
-    if re.fullmatch(r"[0-9]{3}71[0-9]{4}", text):
-        text = text[:3] + "가" + text[5:]
-    elif re.fullmatch(r"[0-9]{2}71[0-9]{4}", text):
-        text = text[:2] + "가" + text[4:]
+    # OCR이 '호'를 '3'으로 잘못 읽는 현상 보정
+    if re.fullmatch(r"[0-9]{3}3[0-9]{4}", text):
+        text = text[:3] + "호" + text[4:]
 
     ocr_conf = ocr_result[0][2]
 
@@ -152,9 +183,52 @@ recognition_start = None
 rejected_time = None
 last_detected_time = None
 absence_timeout = 3.0
+PENDING_CHECK_INTERVAL = 2.0
+last_pending_check = 0.0
+# 앱 출차 요청으로 열었는지 구분한다. 앱 출차는 카메라 확인 없이 EXITED 처리하지 않는다.
+gate_source = None
 
 try:
     while True:
+        # 게이트가 대기 중일 때만 서버의 앱 출차 요청을 확인한다.
+        # YOLO/OCR 처리 시간이 있어 정확히 2초마다 실행되지는 않을 수 있다.
+        if gate_state == "WAITING" and time.monotonic() - last_pending_check >= PENDING_CHECK_INTERVAL:
+            last_pending_check = time.monotonic()
+            try:
+                pending_requests = get_pending_exit_requests()
+            except (requests.exceptions.RequestException, ValueError) as error:
+                print("출차 요청 조회 실패:", error)
+            else:
+                if pending_requests:
+                    req = pending_requests[0]  # 공용 차단봉은 한 번에 한 대만 처리
+                    reservation_id = req.get("reservation_id")
+                    if type(reservation_id) is not int or reservation_id <= 0:
+                        print("잘못된 출차 요청:", req)
+                    else:
+                        print("앱 출차 요청:", req)
+                        # 물리적 안전을 위해 실제 차량 위치를 확인하고 시연할 것.
+                        try:
+                            control_gate("open")
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                            print("차단봉 열기 실패:", error)
+                            break
+                        try:
+                            notify_gate_opened(reservation_id)
+                        except (requests.exceptions.RequestException, ValueError) as error:
+                            print("개방 확인 전송 실패:", error)
+                            print("서버 상태 확인 필요. 안전을 위해 게이트를 닫고 종료합니다")
+                            try:
+                                control_gate("close")
+                            except Exception as close_error:
+                                print("차단봉 닫기 실패:", close_error)
+                            break
+                        gate_reservation_id = reservation_id
+                        gate_spot_id = req.get("spot_id")
+                        gate_action = "exit"
+                        gate_source = "app"
+                        gate_state = "OPEN"
+                        continue
+
         if gate_state == "REJECTED":
             if time.monotonic() - rejected_time >= 5:
                 print("재인식 대기 상태로 복귀")
@@ -195,6 +269,12 @@ try:
                     result = request_parking_enter(gate_reservation_id)
                     print("입차 처리 성공")
 
+                elif gate_action == "exit" and gate_source == "app":
+                    # 서버 요구사항: EXITED는 출구 카메라 확인 후 기존 exit API가 처리.
+                    # IR 센서만으로 차량 번호를 검증할 수 없으므로 여기서는 EXITED 변경 안 함.
+                    result = None
+                    print("앱 출차 차량 통과 감지. EXITED는 출구 카메라 확인 후 처리 필요")
+
                 elif gate_action == "exit":
                     result = request_parking_exit(gate_reservation_id)
                     print("출차 처리 성공")
@@ -202,8 +282,9 @@ try:
                 else:
                     raise ValueError("알 수 없는 게이트 동작입니다")
 
-                print("예약 번호:", result["reservation_id"])
-                print("주차칸:", result["spot_id"])
+                if result is not None:
+                    print("예약 번호:", result["reservation_id"])
+                    print("주차칸:", result["spot_id"])
 
             except (requests.exceptions.RequestException, ValueError) as error:
                 print("주차 상태 변경 API 실패:", error)
@@ -308,6 +389,7 @@ try:
                         gate_reservation_id = gate["reservation_id"]
                         gate_spot_id = gate["spot_id"]
                         gate_action = gate["action"]
+                        gate_source = "camera"
 
                         print("게이트 승인:", final_plate)
                         print("동작:", gate_action)
