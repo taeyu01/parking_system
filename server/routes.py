@@ -29,8 +29,10 @@ from utils import (
     BUFFER_MINUTES,
     DEFAULT_DURATION_MINUTES,
     ENTRY_EARLY_MINUTES,
+    EXIT_REQUEST_MINUTES,
     MAX_ADVANCE_DAYS,
     MAX_DURATION_MINUTES,
+    MIN_GAP_MINUTES,
     NOSHOW_MINUTES,
     SLOT_MINUTES,
     START_GRACE_MINUTES,
@@ -216,6 +218,74 @@ def _extension_error(reservation, add_minutes, now):
     return None
 
 
+def _hhmm(value):
+    return value.strftime("%H:%M")
+
+
+def _next_start_after(spot_id, start):
+    """같은 칸에서 start 이후에 시작하는 가장 이른 진행 중 예약의 시작 시각 (없으면 None)"""
+    return db.session.scalar(
+        select(func.min(Reservation.start_at)).where(
+            Reservation.spot_id == spot_id,
+            Reservation.status.in_(RS.ACTIVE),
+            Reservation.start_at >= start,
+        )
+    )
+
+
+def _available_until(spot_id, start):
+    """start부터 이 칸을 쓸 수 있는 마지막 시각 (다음 예약 시작 - 간격). 뒤에 예약이 없으면 None(제한 없음)"""
+    nxt = _next_start_after(spot_id, start)
+    return None if nxt is None else nxt - _minutes(BUFFER_MINUTES)
+
+
+def _gap_check(spot_id, start, end):
+    """예약 가능 여부와 안내 문구를 함께 판단한다. 반환: (가능 여부, available_until, 안내 문구 또는 None)
+
+    - start 시점에 칸이 이미 겹쳐 있으면 불가 (available_until은 None)
+    - 다음 예약 때문에 쓸 수 있는 시간이 MIN_GAP_MINUTES보다 짧으면 불가
+    - 요청한 end가 available_until을 넘으면 불가 (몇 시 이전까지만 가능한지 안내)
+    """
+    if _spot_conflict(spot_id, start, start + _minutes(1)):
+        return False, None, f"해당 시간대에는 이미 예약이 있어요. (예약 사이에는 {BUFFER_MINUTES}분 간격이 필요해요)"
+    until = _available_until(spot_id, start)
+    if until is not None:
+        usable = (until - start).total_seconds() / 60
+        if usable < MIN_GAP_MINUTES:
+            return False, until, (
+                f"다음 예약 때문에 이 시간대는 {_hhmm(until)} 이전까지만 쓸 수 있어요. "
+                f"이용 가능한 시간이 {MIN_GAP_MINUTES}분보다 짧아 예약할 수 없어요."
+            )
+        if end > until:
+            return False, until, f"{_hhmm(until)} 이전까지만 이용할 수 있어요. 이용 시간을 줄이거나 다른 자리를 선택해 주세요."
+    if _spot_conflict(spot_id, start, end):  # 위에서 안 걸러진 나머지 겹침
+        return False, until, f"해당 시간대에는 이미 예약이 있어요. (예약 사이에는 {BUFFER_MINUTES}분 간격이 필요해요)"
+    return True, until, None
+
+
+def _exit_request_state(reservation, now):
+    """[이용 종료] 요청 상태: NONE / PENDING(파이가 아직 안 열음) / OPENED(열림, 출차 대기) / EXPIRED(시간 지남)
+    반환: (상태, 요청 시각, 만료 시각)"""
+    requested = reservation.exit_requested_at
+    if requested is None or reservation.status != RS.ENTERED:
+        return "NONE", None, None
+    expires = requested + _minutes(EXIT_REQUEST_MINUTES)
+    if now >= expires:
+        return "EXPIRED", requested, expires
+    if reservation.exit_gate_opened_at is not None:
+        return "OPENED", requested, expires
+    return "PENDING", requested, expires
+
+
+def _exit_request_dict(reservation, now):
+    state, requested, expires = _exit_request_state(reservation, now)
+    return {
+        "exit_request": state,
+        "exit_requested_at": fmt_dt(requested),
+        "exit_expires_at": fmt_dt(expires),
+    }
+
+
 def compute_alert(reservation, now=None):
     """종료 알림 판단. 앱이 주기적으로 조회할 때(폴링)도, 나중에 푸시(FCM)를 붙일 때도 이 함수를 같이 쓴다.
 
@@ -345,8 +415,9 @@ def create_reservation():
 
     # 동시에 같은 시간대를 예약하는 요청을 막기 위해 잠금을 잡고, 겹치는지 다시 확인한다.
     _lock_all_spots()
-    if _spot_conflict(spot_id, start, end):
-        return fail(f"해당 시간대에는 이미 예약이 있어요. (예약 사이에는 {BUFFER_MINUTES}분 간격이 필요해요)")
+    can_book, _until, message = _gap_check(spot_id, start, end)
+    if not can_book:
+        return fail(message)
     if _plate_conflict(plate, start, end):
         return fail("같은 차량번호로 시간이 겹치는 예약이 이미 있어요.")
 
@@ -417,6 +488,44 @@ def extend_reservation(reservation_id):
     )
 
 
+@api.post("/reservations/<int:reservation_id>/request-exit")
+def request_exit(reservation_id):
+    """앱 [이용 종료(차단봉 열기)] 버튼. 입차 중인 예약에만 열기 요청을 기록한다.
+
+    - 상태는 바꾸지 않는다. EXITED 처리는 출구 카메라가 번호판을 확인한 뒤 기존 exit로만 한다.
+    - 요청은 EXIT_REQUEST_MINUTES분 동안만 유효하다. 지나면 앱에서 다시 눌러야 한다.
+    - 같은 요청이 연달아 와도 유효한 요청이 있으면 그대로 돌려준다. (시간을 새로 늘리지 않음)
+    - member_id를 같이 보내면 본인 예약인지 확인한다. (로그인 토큰이 없는 동안의 최소한의 확인)
+    """
+    body = get_body()
+    member_id = to_int(body.get("member_id"))
+
+    reservation = _lock_reservation(reservation_id)
+    if reservation is None:
+        return fail("존재하지 않는 예약이에요.")
+    if member_id is not None and member_id != reservation.member_id:
+        return fail("본인의 예약이 아니에요.")
+    if reservation.status != RS.ENTERED:
+        return fail("입차 중인 예약만 차단봉 열기를 요청할 수 있어요.")
+
+    now = now_local()
+    state, _, _ = _exit_request_state(reservation, now)
+    if state not in ("PENDING", "OPENED"):  # 요청이 없거나 만료됐으면 새로 요청
+        reservation.exit_requested_at = now
+        reservation.exit_gate_opened_at = None
+        error = _commit()
+        if error:
+            return error
+
+    info = _exit_request_dict(reservation, now)
+    return ok(
+        reservation_id=reservation.id,
+        spot_id=reservation.spot_id,
+        message=f"{EXIT_REQUEST_MINUTES}분 안에 출차해 주세요. 시간이 지나면 다시 눌러야 해요.",
+        **info,
+    )
+
+
 @api.get("/reservations")
 def list_reservations():
     member_id = to_int(request.args.get("member_id"))
@@ -433,6 +542,7 @@ def list_reservations():
     for r in rows:
         item = r.to_dict()
         item.update(compute_alert(r, now))  # minutes_left, alert
+        item.update(_exit_request_dict(r, now))  # exit_request, exit_requested_at, exit_expires_at
         items.append(item)
     return ok(reservations=items)
 
@@ -456,7 +566,11 @@ def list_spots():
     for spot in spots:
         item = {"spot_id": spot.id, "status": _display_status(spot, now)}
         if window is not None:
-            item["available"] = not _spot_conflict(spot.id, window[0], window[1])
+            can_book, until, message = _gap_check(spot.id, window[0], window[1])
+            item["available"] = can_book
+            # 이 시작 시각부터 쓸 수 있는 마지막 시각 (None이면 제한 없음 또는 해당 없음)
+            item["available_until"] = fmt_dt(until)
+            item["message"] = message  # 예약 불가 이유 / "몇 시 이전까지만" 안내 (가능하면 None)
         items.append(item)
     return ok(spots=items)
 
@@ -559,6 +673,65 @@ def parking_exit():
     reservation.status = RS.EXITED
     reservation.exited_at = now_local()
     _release_spot_if_free(spot, reservation.id)
+    error = _commit()
+    if error:
+        return error
+    return ok(reservation_id=reservation.id, spot_id=reservation.spot_id)
+
+
+@api.get("/gate/pending")
+def gate_pending():
+    """[파이용] 차단봉을 열어야 하는 요청 목록. 파이가 주기적으로 조회한다. ?spot_id=2 로 칸을 좁힐 수 있다.
+
+    열어야 하는 요청 = 입차 중(ENTERED) + 앱에서 [이용 종료]를 누름 + 아직 안 열었음 + 유효 시간 안
+    """
+    now = now_local()
+    stmt = select(Reservation).where(
+        Reservation.status == RS.ENTERED,
+        Reservation.exit_requested_at.is_not(None),
+        Reservation.exit_requested_at > now - _minutes(EXIT_REQUEST_MINUTES),
+        Reservation.exit_gate_opened_at.is_(None),
+    )
+    spot_param = request.args.get("spot_id")
+    if spot_param is not None:
+        spot_id = to_int(spot_param)
+        if spot_id is None or not 1 <= spot_id <= SPOT_COUNT:
+            return fail(f"spot_id는 1~{SPOT_COUNT} 사이여야 해요.")
+        stmt = stmt.where(Reservation.spot_id == spot_id)
+    rows = db.session.scalars(stmt.order_by(Reservation.exit_requested_at)).all()
+    return ok(
+        requests=[
+            {
+                "reservation_id": r.id,
+                "spot_id": r.spot_id,
+                "plate_number": r.plate_number,
+                "requested_at": fmt_dt(r.exit_requested_at),
+                "expires_at": fmt_dt(r.exit_requested_at + _minutes(EXIT_REQUEST_MINUTES)),
+            }
+            for r in rows
+        ]
+    )
+
+
+@api.post("/gate/opened")
+def gate_opened():
+    """[파이용] 차단봉을 열었다고 알리는 API. 요청을 '열림'으로 바꿔 같은 요청이 다시 조회되지 않게 한다."""
+    reservation_id = to_int(get_body().get("reservation_id"))
+    if reservation_id is None:
+        return fail("reservation_id가 필요해요.")
+
+    reservation = _lock_reservation(reservation_id)
+    if reservation is None:
+        return fail("존재하지 않는 예약이에요.")
+
+    now = now_local()
+    state, _, _ = _exit_request_state(reservation, now)
+    if state == "OPENED":  # 이미 알렸으면 그대로 성공 (재전송 대비)
+        return ok(reservation_id=reservation.id, spot_id=reservation.spot_id)
+    if state != "PENDING":
+        return fail("유효한 차단봉 열기 요청이 없어요.")
+
+    reservation.exit_gate_opened_at = now
     error = _commit()
     if error:
         return error

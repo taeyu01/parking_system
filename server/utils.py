@@ -28,6 +28,8 @@ BUFFER_MINUTES = _env_int("BUFFER_MINUTES", 15)                  # 같은 칸 �
 ENTRY_EARLY_MINUTES = _env_int("ENTRY_EARLY_MINUTES", 10)        # 시작 몇 분 전부터 입장 가능한지
 NOSHOW_MINUTES = _env_int("NOSHOW_MINUTES", 30)                  # 시작 후 몇 분이 지나면 노쇼로 자동 취소할지
 ALERT_MINUTES = _env_int("ALERT_MINUTES", 10)                    # 종료 몇 분 전부터 알림(alert)을 줄지
+EXIT_REQUEST_MINUTES = _env_int("EXIT_REQUEST_MINUTES", 5)      # 앱에서 [이용 종료]를 누른 뒤 차단봉 열기 요청이 유효한 시간(분)
+MIN_GAP_MINUTES = _env_int("MIN_GAP_MINUTES", 60)                # 예약과 예약 사이 빈 시간이 이보다 짧으면 그 구간은 예약 불가(분)
 START_GRACE_MINUTES = 5                                          # 시작 시각을 과거로 보내도 봐주는 오차(분)
 MAX_ADVANCE_DAYS = 30                                            # 며칠 뒤까지 예약할 수 있는지
 

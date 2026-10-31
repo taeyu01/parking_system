@@ -69,6 +69,9 @@ class Reservation(db.Model):
     entered_at = db.Column(db.DateTime, nullable=True)  # 실제 입차 시각
     exited_at = db.Column(db.DateTime, nullable=True)   # 실제 출차 시각
     # 종료 10분/5분 전 푸시를 보냈는지 기록 (푸시(FCM)를 붙일 때 사용, 지금은 비워 둠)
+    # 앱에서 [이용 종료(차단봉 열기)]를 누른 시각 / 파이가 차단봉을 열었다고 알려 준 시각
+    exit_requested_at = db.Column(db.DateTime, nullable=True)
+    exit_gate_opened_at = db.Column(db.DateTime, nullable=True)
     notified_10 = db.Column(db.Boolean, nullable=False, default=False)
     notified_5 = db.Column(db.Boolean, nullable=False, default=False)
 

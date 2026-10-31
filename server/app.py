@@ -4,8 +4,9 @@
  1) .env에서 DB 접속 정보 읽기
  2) 데이터베이스가 없으면 생성 (CREATE DATABASE IF NOT EXISTS)
  3) 테이블 자동 생성
- 4) 주차칸이 비어 있으면 1~6번 칸을 EMPTY로 추가
- 5) API 등록 후 0.0.0.0 으로 열기 (앱/파이가 접속할 수 있게)
+ 4) 이미 있는 테이블에 새로 생긴 컬럼 추가 (create_all은 컬럼을 추가해 주지 않아서)
+ 5) 주차칸이 비어 있으면 1~6번 칸을 EMPTY로 추가
+ 6) API 등록 후 0.0.0.0 으로 열기 (앱/파이가 접속할 수 있게)
 """
 import os
 import re
@@ -14,7 +15,7 @@ from urllib.parse import quote_plus
 import pymysql
 from dotenv import load_dotenv
 from flask import Flask
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 
 from models import SPOT_COUNT, ParkingSpot, SpotStatus, db
 from routes import api
@@ -55,6 +56,23 @@ def ensure_database(config):
         conn.close()
 
 
+# 테이블이 먼저 만들어진 뒤에 추가된 컬럼들. (테이블 이름, 컬럼 이름, 컬럼 정의)
+NEW_COLUMNS = (
+    ("reservations", "exit_requested_at", "DATETIME NULL"),
+    ("reservations", "exit_gate_opened_at", "DATETIME NULL"),
+)
+
+
+def ensure_columns():
+    """기존 DB에 빠진 컬럼만 추가한다. 이미 있으면 아무것도 하지 않는다."""
+    inspector = inspect(db.engine)
+    for table, column, definition in NEW_COLUMNS:
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        if column not in existing:
+            db.session.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"))
+    db.session.commit()
+
+
 def seed_spots():
     """주차칸이 하나도 없으면 1~SPOT_COUNT번 칸을 EMPTY로 추가"""
     count = db.session.scalar(select(func.count()).select_from(ParkingSpot))
@@ -85,6 +103,7 @@ def create_app():
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        ensure_columns()
         seed_spots()
 
     app.register_blueprint(api)

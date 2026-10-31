@@ -26,8 +26,10 @@ from models import Member, ParkingSpot, Reservation, db
 from utils import (
     BUFFER_MINUTES,
     ENTRY_EARLY_MINUTES,
+    EXIT_REQUEST_MINUTES,
     MAX_ADVANCE_DAYS,
     MAX_DURATION_MINUTES,
+    MIN_GAP_MINUTES,
     NOSHOW_MINUTES,
     SLOT_MINUTES,
 )
@@ -413,6 +415,108 @@ success = [x for x in results if x and x.get("success")]
 expect(f"같은 번호판이 두 칸에 동시 예약 -> 성공 1건 (결과: {len(success)}건)", len(success) == 1, results)
 
 mark("[7] 동시 요청")
+
+# ---------------------------------------------------------------------
+print("\n[8] 일찍 나가기([이용 종료]) / 빈 시간 안내 / 최소 빈 시간")
+reset_scenario()
+
+
+def spot_item(spot_id, start, duration):
+    spots = call("GET", "/spots", params={"start_at": fmt(start), "duration_minutes": duration})["spots"]
+    return next(x for x in spots if x["spot_id"] == spot_id)
+
+
+# X(A): 4번 칸 지금부터 DUR 이용, 입차. Y(B): 같은 칸 4시간 뒤 SHORT 예약.
+r = call("POST", "/reservations", {"member_id": ma, "spot_id": 4, "duration_minutes": DUR})
+res_x = r["reservation_id"]
+y_start = now() + timedelta(hours=4)
+r = call("POST", "/reservations", {"member_id": mb, "spot_id": 4, "start_at": fmt(y_start), "duration_minutes": SHORT})
+res_y = r["reservation_id"]
+y_start = parse(r["start_at"])
+until = y_start - timedelta(minutes=BUFFER_MINUTES)
+
+r = call("POST", f"/reservations/{res_x}/request-exit", {"member_id": ma})
+expect("입차 전(RESERVED)에는 차단봉 열기 요청 불가", r.get("success") is False, r)
+call("POST", "/parking/enter", {"reservation_id": res_x})
+r = call("POST", f"/reservations/{res_x}/request-exit", {"member_id": mb})
+expect("남의 예약에는 차단봉 열기 요청 불가", r.get("success") is False, r)
+r = call("POST", f"/reservations/{res_y}/request-exit", {"member_id": mb})
+expect("아직 입차 안 한 예약(Y)은 요청 불가", r.get("success") is False, r)
+
+r = call("POST", f"/reservations/{res_x}/request-exit", {"member_id": ma})
+expect("입차 중인 본인 예약은 열기 요청 성공 (exit_request=PENDING)", r.get("success") is True and r.get("exit_request") == "PENDING", r)
+first_requested = r["exit_requested_at"]
+expect(f"요청 유효 시간은 {EXIT_REQUEST_MINUTES}분", parse(r["exit_expires_at"]) - parse(first_requested) == timedelta(minutes=EXIT_REQUEST_MINUTES), r)
+r = call("POST", f"/reservations/{res_x}/request-exit", {"member_id": ma})
+expect("연달아 눌러도 요청 시각이 그대로 (중복 요청 안전)", r.get("success") is True and r["exit_requested_at"] == first_requested, r)
+row = res_row(ma, res_x)
+expect("내 예약 조회에 exit_request 상태가 보임", row["exit_request"] == "PENDING" and row["status"] == "ENTERED", row)
+
+r = call("GET", "/gate/pending", params={"spot_id": 4})
+expect("파이 조회(4번 칸): 열어야 할 요청 1건", r.get("success") is True and [q["reservation_id"] for q in r["requests"]] == [res_x], r)
+r = call("GET", "/gate/pending", params={"spot_id": 5})
+expect("파이 조회(5번 칸): 요청 없음", r.get("success") is True and r["requests"] == [], r)
+
+item = spot_item(4, now() + timedelta(minutes=SHORT), SHORT)
+expect("차단봉만 열린 단계(출차 확인 전)에는 칸이 아직 예약 불가", item["available"] is False, item)
+
+r = call("POST", "/gate/opened", {"reservation_id": res_x})
+expect("파이가 차단봉 열었다고 알림", r.get("success") is True, r)
+r = call("POST", "/gate/opened", {"reservation_id": res_x})
+expect("열림 알림을 다시 보내도 성공 (재전송 안전)", r.get("success") is True, r)
+r = call("GET", "/gate/pending", params={"spot_id": 4})
+expect("열었으면 더 이상 조회되지 않음", r["requests"] == [], r)
+row = res_row(ma, res_x)
+expect("앱에는 OPENED (차단봉 열림, 출차 대기)", row["exit_request"] == "OPENED" and row["status"] == "ENTERED", row)
+
+r = call("POST", "/parking/exit", {"reservation_id": res_x})
+expect("출구 카메라 확인 후 출차 처리", r.get("success") is True, r)
+expect("출차 후 4번 칸은 앱에서 빈칸(EMPTY)", spot_status(4) == "EMPTY", spot_status(4))
+row = res_row(ma, res_x)
+expect("출차 후 상태 EXITED, 요청 상태는 NONE", row["status"] == "EXITED" and row["exit_request"] == "NONE", row)
+
+item = spot_item(4, now(), SHORT)
+expect("일찍 나간 뒤 그 시간대 예약 가능", item["available"] is True and item["message"] is None, item)
+expect("available_until = 뒤 예약 시작 - 간격 (몇 시 이전까지만 사용 가능)", item["available_until"] == fmt(until), (item, fmt(until)))
+long_minutes = int((until - now()).total_seconds() // 60) + SLOT_MINUTES
+long_minutes = ((long_minutes + SLOT_MINUTES - 1) // SLOT_MINUTES) * SLOT_MINUTES
+item = spot_item(4, now(), long_minutes)
+expect("빈 시간을 넘기는 이용 시간은 예약 불가 + 안내 문구", item["available"] is False and until.strftime("%H:%M") in item["message"], item)
+r = call("POST", "/reservations", {"member_id": mc, "spot_id": 4, "duration_minutes": long_minutes})
+expect("그 시간으로 예약하려 하면 '몇 시 이전까지만' 안내와 함께 거부", r.get("success") is False and until.strftime("%H:%M") in r.get("message", ""), r)
+r = call("POST", "/reservations", {"member_id": mc, "spot_id": 4, "duration_minutes": SHORT})
+expect("빈 시간 안에 들어가는 예약은 성공", r.get("success") is True, r)
+res_c4 = r["reservation_id"]
+
+# 최소 빈 시간: 뒤 예약까지 MIN_GAP_MINUTES보다 짧으면 예약 불가, 넉넉하면 가능
+short_gap_start = now() + timedelta(minutes=BUFFER_MINUTES + MIN_GAP_MINUTES - 20)
+call("POST", "/reservations", {"member_id": mb, "spot_id": 5, "start_at": fmt(short_gap_start), "duration_minutes": SLOT_MINUTES})
+item = spot_item(5, now(), SLOT_MINUTES)
+expect(f"뒤 예약까지 {MIN_GAP_MINUTES}분보다 짧게 비면 예약 불가", item["available"] is False and "짧" in item["message"], item)
+r = call("POST", "/reservations", {"member_id": ma, "spot_id": 5, "duration_minutes": SLOT_MINUTES})
+expect("짧은 빈 시간에 예약 시도하면 거부", r.get("success") is False, r)
+wide_gap_start = now() + timedelta(minutes=BUFFER_MINUTES + MIN_GAP_MINUTES + 10)
+call("POST", "/reservations", {"member_id": mb, "spot_id": 6, "start_at": fmt(wide_gap_start), "duration_minutes": SLOT_MINUTES})
+r = call("POST", "/reservations", {"member_id": ma, "spot_id": 6, "duration_minutes": SLOT_MINUTES})
+expect(f"빈 시간이 {MIN_GAP_MINUTES}분 이상이면 예약 가능", r.get("success") is True, r)
+
+# 요청 만료: 요청 후 EXIT_REQUEST_MINUTES분이 지나면 무효, 다시 누르면 새 요청
+call("POST", "/parking/enter", {"reservation_id": res_c4})
+r = call("POST", f"/reservations/{res_c4}/request-exit", {"member_id": mc})
+expect("C가 열기 요청", r.get("exit_request") == "PENDING", r)
+with app.app_context():
+    rv = db.session.get(Reservation, res_c4)
+    rv.exit_requested_at -= timedelta(minutes=EXIT_REQUEST_MINUTES + 1)
+    db.session.commit()
+row = res_row(mc, res_c4)
+expect(f"{EXIT_REQUEST_MINUTES}분이 지나면 EXPIRED", row["exit_request"] == "EXPIRED", row)
+r = call("GET", "/gate/pending", params={"spot_id": 4})
+expect("만료된 요청은 파이가 조회해도 나오지 않음", r["requests"] == [], r)
+r = call("POST", "/gate/opened", {"reservation_id": res_c4})
+expect("만료된 요청에는 열림 알림 불가", r.get("success") is False, r)
+r = call("POST", f"/reservations/{res_c4}/request-exit", {"member_id": mc})
+expect("다시 누르면 새 요청(PENDING)", r.get("success") is True and r["exit_request"] == "PENDING", r)
+mark("[8] 일찍 나가기 / 빈 시간 안내 / 최소 빈 시간")
 
 reset_scenario()  # 남은 진행 중 예약을 마무리하고 4·5·6번 칸을 비운다
 print(f"\n전체 통과: {passed}개 항목")
