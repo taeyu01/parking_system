@@ -8,6 +8,8 @@ from collections import Counter, deque      # 득표수 계산, 최근 OCR 결�
 from picamera2 import Picamera2, Preview    # Pi 카메라 제어 및 미리보기
 import subprocess
 from pathlib import Path
+import lgpio             # GPIO21 수동 부저와 RGB LED 제어
+import threading         # 추론 중에도 LED 점멸을 유지
 
 model = YOLO("models/best_plate_yolo26.pt")
 reader = easyocr.Reader(["ko", "en"], gpu=False)
@@ -17,6 +19,170 @@ SERVER = "http://192.168.10.12:5000"
 
 SERVO = (Path(__file__).resolve().parent.parent/"hardware"/"servo"/"sg90")
 IR = (Path(__file__).resolve().parent.parent/"hardware"/"ir"/"ir")
+
+# 부저의 S 핀이 연결된 BCM GPIO 번호 (물리 핀 40번)
+BUZZER_GPIO = 21
+buzzer_handle = None
+
+# RGB LED: 공통 캐소드(공통 GND), 각 색상 핀에 별도 전류 제한 저항
+LED_RED = 26    # 물리 37번
+LED_GREEN = 20  # 물리 38번
+LED_BLUE = 16   # 물리 36번
+LED_PINS = (LED_RED, LED_GREEN, LED_BLUE)
+LED_COMMON_ANODE = False
+led_handle = None
+led_claimed = []
+led_mode = "WAITING"
+led_lock = threading.Lock()
+led_stop = threading.Event()
+led_thread = None
+
+
+def setup_led():
+    """LED GPIO를 점유하고 점멸용 백그라운드 스레드를 시작한다."""
+    global led_handle, led_thread
+    try:
+        led_handle = lgpio.gpiochip_open(0)
+        initial = 1 if LED_COMMON_ANODE else 0
+        for pin in LED_PINS:
+            lgpio.gpio_claim_output(led_handle, pin, initial)
+            led_claimed.append(pin)
+        led_stop.clear()
+        led_thread = threading.Thread(target=led_loop, name="rgb-led", daemon=True)
+        led_thread.start()
+        print("RGB LED 준비 완료 (R26 G20 B16)")
+    except (OSError, lgpio.error) as error:
+        print("RGB LED 초기화 실패 (LED 없이 진행):", error)
+        cleanup_led()
+
+
+def set_led_mode(mode):
+    """WAITING, RECOGNIZING, OPEN, REJECTED, CLEARING 중 하나."""
+    global led_mode
+    with led_lock:
+        led_mode = mode
+
+
+def led_output(r, g, b):
+    if led_handle is None:
+        return
+    for pin, enabled in zip(LED_PINS, (r, g, b)):
+        level = int(not enabled) if LED_COMMON_ANODE else int(bool(enabled))
+        lgpio.gpio_write(led_handle, pin, level)
+
+
+def led_loop():
+    """YOLO/OCR이나 IR 센서가 블로킹돼도 점멸 유지."""
+    blink_on = True
+    previous_mode = None
+    while not led_stop.is_set():
+        with led_lock:
+            mode = led_mode
+        if mode != previous_mode:
+            blink_on = True
+            previous_mode = mode
+        if mode == "WAITING":
+            color, interval = (1, 0, 0), 0.1
+        elif mode == "RECOGNIZING":
+            color, interval = ((1, 1, 0) if blink_on else (0, 0, 0)), 0.35
+        elif mode == "OPEN":
+            color, interval = (0, 1, 0), 0.1
+        elif mode == "REJECTED":
+            color, interval = ((1, 0, 0) if blink_on else (0, 0, 0)), 0.15
+        elif mode == "CLEARING":
+            color, interval = (0, 0, 1), 0.1
+        else:
+            color, interval = (0, 0, 0), 0.1
+        try:
+            led_output(*color)
+        except (OSError, lgpio.error) as error:
+            print("RGB LED 제어 실패:", error)
+            break
+        if led_stop.wait(interval):
+            break
+        if mode in ("RECOGNIZING", "REJECTED"):
+            blink_on = not blink_on
+    try:
+        led_output(0, 0, 0)
+    except (OSError, lgpio.error):
+        pass
+
+
+def cleanup_led():
+    """점멸 스레드를 멈춘 다음 GPIO 자원을 반납."""
+    global led_handle, led_thread
+    led_stop.set()
+    if led_thread is not None:
+        led_thread.join(timeout=2)
+        led_thread = None
+    if led_handle is not None:
+        try:
+            for pin in led_claimed:
+                off = 1 if LED_COMMON_ANODE else 0
+                lgpio.gpio_write(led_handle, pin, off)
+        except (OSError, lgpio.error) as error:
+            print("RGB LED 소등 실패:", error)
+        finally:
+            lgpio.gpiochip_close(led_handle)
+            led_handle = None
+            led_claimed.clear()
+
+
+def setup_buzzer():
+    """부저 준비. 부저 오류가 나더라도 차단기 기능은 계속 사용한다."""
+    global buzzer_handle
+    try:
+        buzzer_handle = lgpio.gpiochip_open(0)  # Raspberry Pi 4: /dev/gpiochip0
+        lgpio.gpio_claim_output(buzzer_handle, BUZZER_GPIO, 0)
+    except (OSError, lgpio.error) as error:
+        print("부저 초기화 실패 (부저 없이 진행):", error)
+        if buzzer_handle is not None:
+            lgpio.gpiochip_close(buzzer_handle)
+            buzzer_handle = None
+
+
+def play_sound(notes):
+    """(주파수 Hz, 지속 시간 초) 목록을 순서대로 재생. 0Hz는 무음."""
+    if buzzer_handle is None:
+        return
+    try:
+        for freq, duration in notes:
+            lgpio.tx_pwm(buzzer_handle, BUZZER_GPIO, freq, 50 if freq else 0)
+            time.sleep(duration)
+    except (OSError, lgpio.error) as error:
+        print("부저 재생 실패:", error)
+    finally:
+        try:
+            lgpio.tx_pwm(buzzer_handle, BUZZER_GPIO, 0, 0)
+        except (OSError, lgpio.error) as error:
+            print("부저 PWM 종료 실패:", error)
+
+
+def entrance_sound():
+    """게이트 승인: 삐빅 (올라가는 두 음)."""
+    play_sound([(900, 0.12), (0, 0.06), (1400, 0.20)])
+
+
+def passed_sound():
+    """차량 통과 완료: 띠리링."""
+    play_sound([(800, 0.08), (1000, 0.08), (1300, 0.08), (1700, 0.25)])
+
+
+def warning_sound():
+    """예약 거절: 삐! 삐! 삐!"""
+    play_sound([(1200, 0.15), (0, 0.12),
+                (1200, 0.15), (0, 0.12), (1200, 0.15)])
+
+
+def cleanup_buzzer():
+    global buzzer_handle
+    if buzzer_handle is not None:
+        # play_sound() 종료 시 이미 PWM 정지 요청을 보냈다.
+        # 중복 tx_pwm(0, 0) 호출은 일부 lgpio 환경에서 bad PWM micros를 낼 수 있어 생략.
+        try:
+            lgpio.gpiochip_close(buzzer_handle)
+        finally:
+            buzzer_handle = None
 
 def control_gate(command):
     subprocess.run(["sudo", "-n", str(SERVO), command], check=True, timeout=5,)
@@ -188,6 +354,9 @@ last_pending_check = 0.0
 # 앱 출차 요청으로 열었는지 구분한다. 앱 출차는 카메라 확인 없이 EXITED 처리하지 않는다.
 gate_source = None
 
+setup_buzzer()
+setup_led()
+
 try:
     while True:
         # 게이트가 대기 중일 때만 서버의 앱 출차 요청을 확인한다.
@@ -207,6 +376,7 @@ try:
                     else:
                         print("앱 출차 요청:", req)
                         # 물리적 안전을 위해 실제 차량 위치를 확인하고 시연할 것.
+                        entrance_sound()  # 게이트를 열기 전에 승인 알림음
                         try:
                             control_gate("open")
                         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
@@ -227,12 +397,14 @@ try:
                         gate_action = "exit"
                         gate_source = "app"
                         gate_state = "OPEN"
+                        set_led_mode("OPEN")
                         continue
 
         if gate_state == "REJECTED":
             if time.monotonic() - rejected_time >= 5:
                 print("재인식 대기 상태로 복귀")
                 gate_state = "WAITING"
+                set_led_mode("WAITING")
                 recent_plates.clear()
                 final_plate = None
                 recognition_start = None
@@ -303,9 +475,22 @@ try:
                 break
 
             print("차단봉 닫기 명령 전송 완료")
+            passed_sound()  # IR로 통과 확인 후 차단봉을 닫은 다음 완료음
 
-            # 이번에는 한 차량만 테스트
-            break
+            # 다음 차량을 위해 상태 초기화. 같은 번호판 재인식 방지용 CLEARING 진입.
+            gate_reservation_id = None
+            gate_spot_id = None
+            gate_action = None
+            gate_source = None
+            final_plate = None
+            recent_plates.clear()
+            recognition_start = None
+            last_detected_time = None
+            clearing_since = None
+            gate_state = "CLEARING"
+            set_led_mode("CLEARING")
+            print("다음 차량 준비: 번호판이 3초간 보이지 않을 때까지 대기")
+            continue
             
 
         frame = picam2.capture_array() # 카메라에서 영상 한 프레임을 NumPy 배열로 가져옴
@@ -317,6 +502,21 @@ try:
 
         result = results[0] # 첫 번째 이미지의 검출 결과 꺼내기
 
+        # 차량이 지나간 뒤에는 이전 번호판이 시야에서 사라진 것을 확인한다.
+        # YOLO 탐지가 3초 동안 없을 때만 다음 차량을 받는다.
+        if gate_state == "CLEARING":
+            if len(result.boxes) == 0:
+                if clearing_since is None:
+                    clearing_since = time.monotonic()
+                elif time.monotonic() - clearing_since >= 3.0:
+                    gate_state = "WAITING"
+                    set_led_mode("WAITING")
+                    last_pending_check = time.monotonic()
+                    print("다음 차량 대기 상태로 복귀")
+            else:
+                clearing_since = None
+            continue
+
         if len(result.boxes) == 0:
             if last_detected_time is not None:
                 if time.monotonic() - last_detected_time >= absence_timeout:
@@ -324,9 +524,13 @@ try:
                     recognition_start = None
                     last_detected_time = None
                     print("번호판 미검출 3초 → Voting 초기화")
+                    if gate_state == "WAITING":
+                        set_led_mode("WAITING")
             continue
 
         last_detected_time = time.monotonic()
+        if gate_state == "WAITING":
+            set_led_mode("RECOGNIZING")
 
         best_box = max(result.boxes, key=lambda box: float(box.conf[0]))
         x1, y1, x2, y2 = map(int, best_box.xyxy[0])
@@ -382,6 +586,7 @@ try:
                     gate_spot_id = None
                     gate_action = None
                     gate_state = "REJECTED"
+                    set_led_mode("REJECTED")
                     rejected_time = time.monotonic()
 
                 else:
@@ -395,6 +600,7 @@ try:
                         print("동작:", gate_action)
                         print("예약 번호:", gate_reservation_id)
                         print("주차칸:", gate_spot_id)
+                        entrance_sound()  # 게이트를 열기 전에 승인 알림음
                         try:
                             control_gate("open")
                         except (subprocess.CalledProcessError,
@@ -407,20 +613,31 @@ try:
                         else:
                             print("차단봉 열기 명령 전송 완료")
                             gate_state = "OPEN"
+                            set_led_mode("OPEN")
                     else:
                         print("게이트 불허:", gate.get("message", "예약 확인 불가"))
+                        warning_sound()  # 번호판/예약 승인 거절 경고음
 
                         gate_reservation_id = None
                         gate_spot_id = None
                         gate_action = None
 
                         gate_state = "REJECTED"
+                        set_led_mode("REJECTED")
                         rejected_time = time.monotonic()
                                     
 except KeyboardInterrupt:
     print("\n프로그램 종료")
 
 finally:
+    try:
+        cleanup_led()
+    except (OSError, lgpio.error) as error:
+        print("RGB LED 정리 실패:", error)
+    try:
+        cleanup_buzzer()  # 종료할 때 GPIO21 PWM과 GPIO 칩 해제
+    except (OSError, lgpio.error) as error:
+        print("부저 정리 실패:", error)
     picam2.stop()
     picam2.close()
     print("정상 종료")
